@@ -494,11 +494,48 @@ def update_sync(config: Config, progress: ProgressCallback | None = None) -> App
                         list_results[i] = prev.cloudflare_list_id
 
                 if list_futures:
+                    # Собираем ошибки, для 404 на update — пробуем пересоздать, для 409 на create — обновляем по имени
+                    pending_creates: list[tuple[int, str, str, list[str]]] = []  # (index, name, desc, chunk)
+                    pending_updates_by_name: list[tuple[int, str, str, list[str]]] = []
+                    # Лениво подгрузим маппинг для 409
+                    existing_by_name_cache: dict[str, str] | None = None
+
+                    def _get_existing_by_name() -> dict[str, str]:
+                        nonlocal existing_by_name_cache
+                        if existing_by_name_cache is None:
+                            try:
+                                existing_by_name_cache = {str(x.get("name")): str(x.get("id")) for x in cf.list_gateway_lists()}
+                            except Exception:
+                                existing_by_name_cache = {}
+                        return existing_by_name_cache
+
                     for future in as_completed(list_futures):
                         operation, index, existing_id = list_futures[future]
                         try:
                             result = future.result()
                         except Exception as exc:
+                            msg = str(exc)
+                            is_404 = "404" in msg or "not found" in msg.lower()
+                            is_409 = "409" in msg or "already exists" in msg.lower()
+                            if operation == "update" and is_404 and not config.dry_run:
+                                # Найдём исходный chunk для пересоздания
+                                for ii, nm, ch, _, pv, ds in prepared_chunks:
+                                    if ii == index:
+                                        pending_creates.append((ii, nm, ds, ch))
+                                        break
+                                done_list_ops += 1
+                                if progress:
+                                    progress("lists", done_list_ops, total_list_ops)
+                                continue
+                            if operation == "create" and is_409 and not config.dry_run:
+                                for ii, nm, ch, _, pv, ds in prepared_chunks:
+                                    if ii == index:
+                                        pending_updates_by_name.append((ii, nm, ds, ch))
+                                        break
+                                done_list_ops += 1
+                                if progress:
+                                    progress("lists", done_list_ops, total_list_ops)
+                                continue
                             op_errors.append(f"list {index} ({operation}): {exc}")
                             done_list_ops += 1
                             if progress:
@@ -513,6 +550,55 @@ def update_sync(config: Config, progress: ProgressCallback | None = None) -> App
                         done_list_ops += 1
                         if progress:
                             progress("lists", done_list_ops, total_list_ops)
+                    # Обработка 409 create -> update по имени
+                    if pending_updates_by_name:
+                        ebm = _get_existing_by_name()
+                        for idx, nm, ds, ch in pending_updates_by_name:
+                            eid = ebm.get(nm)
+                            if eid:
+                                try:
+                                    items = [{"value": d} for d in ch]
+                                    cf.update_gateway_list(eid, name=nm, description=ds, items=items)
+                                    list_results[idx] = eid
+                                except Exception as exc:
+                                    op_errors.append(f"list {idx} (create 409->update): {exc}")
+                            else:
+                                op_errors.append(f"list {idx} (create 409): no existing id for {nm}")
+                    # Пересоздание для 404 — с обработкой 409 (уже существует по имени)
+                    if pending_creates:
+                        # Нужен маппинг имя -> id для существующих списков (для 409)
+                        try:
+                            existing_by_name = {str(x.get("name")): str(x.get("id")) for x in cf.list_gateway_lists()}
+                        except Exception:
+                            existing_by_name = {}
+                        with ThreadPoolExecutor(max_workers=config.list_workers) as exec2:
+                            recreate_futures = {}
+                            for idx, nm, ds, ch in pending_creates:
+                                items = [{"value": d} for d in ch]
+                                fut = exec2.submit(cf.create_gateway_list, name=nm, description=ds, items=items)
+                                recreate_futures[fut] = (idx, nm, ds, ch)
+                            for fut in as_completed(recreate_futures):
+                                idx, nm, ds, ch = recreate_futures[fut]
+                                try:
+                                    res = fut.result()
+                                    nid = res.get("id", f"dry-run-{idx}") if isinstance(res, dict) else f"dry-run-{idx}"
+                                    list_results[idx] = nid
+                                    newly_created.append(nid)
+                                except Exception as exc:
+                                    msg2 = str(exc)
+                                    if "409" in msg2 or "already exists" in msg2.lower():
+                                        # Попробуем обновить существующий по имени
+                                        existing_id = existing_by_name.get(nm)
+                                        if existing_id:
+                                            try:
+                                                items = [{"value": d} for d in ch]
+                                                cf.update_gateway_list(existing_id, name=nm, description=ds, items=items)
+                                                list_results[idx] = existing_id
+                                                continue
+                                            except Exception as exc2:
+                                                op_errors.append(f"list {idx} (recreate 409->update): {exc2}")
+                                                continue
+                                    op_errors.append(f"list {idx} (recreate): {exc}")
 
             if op_errors and not config.dry_run:
                 _rollback_lists(cf, [lid for lid in newly_created if not lid.startswith("dry-run-")])
@@ -536,18 +622,83 @@ def update_sync(config: Config, progress: ProgressCallback | None = None) -> App
             )
             try:
                 if current.rule and rule_needs_update:
-                    cf.update_gateway_rule(current.rule.cloudflare_rule_id, build_rule_payload(config, list_ids))
-                    rule = RuleState(
-                        name=current.rule.name,
-                        cloudflare_rule_id=current.rule.cloudflare_rule_id,
-                        precedence=config.rule_precedence,
-                    )
+                    try:
+                        cf.update_gateway_rule(current.rule.cloudflare_rule_id, build_rule_payload(config, list_ids))
+                        rule = RuleState(
+                            name=current.rule.name,
+                            cloudflare_rule_id=current.rule.cloudflare_rule_id,
+                            precedence=config.rule_precedence,
+                        )
+                    except Exception as exc:
+                        msg = str(exc)
+                        is_404 = "404" in msg or "not found" in msg.lower() or "invalid rule" in msg.lower()
+                        if is_404 and not config.dry_run:
+                            # stale rule id — пробуем найти существующее правило с тем же precedence/name и обновить его
+                            try:
+                                rule_resp = cf.create_gateway_rule(build_rule_payload(config, list_ids))
+                                rid = rule_resp.get("id", "dry-run-rule") if isinstance(rule_resp, dict) else "dry-run-rule"
+                                rule = RuleState(name=config.rule_name, cloudflare_rule_id=rid, precedence=config.rule_precedence)
+                            except Exception as exc2:
+                                msg2 = str(exc2)
+                                if ("409" in msg2 or "already exists" in msg2.lower()) and not config.dry_run:
+                                    # Найдём существующее managed правило и обновим его
+                                    try:
+                                        all_rules = cf.list_gateway_rules()
+                                        target = None
+                                        for r in all_rules:
+                                            if is_managed_rule(r, config.rule_name):
+                                                target = r
+                                                break
+                                        if target is None:
+                                            for r in all_rules:
+                                                try:
+                                                    if int(r.get("precedence", -1)) == config.rule_precedence:
+                                                        target = r
+                                                        break
+                                                except (TypeError, ValueError):
+                                                    continue
+                                        if target:
+                                            cf.update_gateway_rule(str(target.get("id")), build_rule_payload(config, list_ids))
+                                            rule = RuleState(
+                                                name=config.rule_name,
+                                                cloudflare_rule_id=str(target.get("id")),
+                                                precedence=config.rule_precedence,
+                                            )
+                                        else:
+                                            raise exc2
+                                    except Exception:
+                                        raise exc2
+                                else:
+                                    raise exc2
+                        else:
+                            raise
                 elif current.rule:
                     rule = current.rule
                 else:
-                    rule_resp = cf.create_gateway_rule(build_rule_payload(config, list_ids))
-                    rid = rule_resp.get("id", "dry-run-rule") if isinstance(rule_resp, dict) else "dry-run-rule"
-                    rule = RuleState(name=config.rule_name, cloudflare_rule_id=rid, precedence=config.rule_precedence)
+                    try:
+                        rule_resp = cf.create_gateway_rule(build_rule_payload(config, list_ids))
+                        rid = rule_resp.get("id", "dry-run-rule") if isinstance(rule_resp, dict) else "dry-run-rule"
+                        rule = RuleState(name=config.rule_name, cloudflare_rule_id=rid, precedence=config.rule_precedence)
+                    except Exception as exc:
+                        msg = str(exc)
+                        if ("409" in msg or "already exists" in msg.lower()) and not config.dry_run:
+                            all_rules = cf.list_gateway_rules()
+                            target = None
+                            for r in all_rules:
+                                if is_managed_rule(r, config.rule_name):
+                                    target = r
+                                    break
+                            if target:
+                                cf.update_gateway_rule(str(target.get("id")), build_rule_payload(config, list_ids))
+                                rule = RuleState(
+                                    name=config.rule_name,
+                                    cloudflare_rule_id=str(target.get("id")),
+                                    precedence=config.rule_precedence,
+                                )
+                            else:
+                                raise
+                        else:
+                            raise
             except Exception as exc:
                 if not config.dry_run:
                     _rollback_lists(cf, [lid for lid in newly_created if not lid.startswith("dry-run-")])
