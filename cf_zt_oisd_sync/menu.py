@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from rich.console import Console
@@ -9,11 +10,22 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .cloudflare import CloudflareClient
-from .config import ConfigError, load_config
+from .config import ConfigError, load_config, write_env_file
 from .models import AppState
 from .oisd import OISDError
-from .state import StateError, delete_state, read_state
-from .sync import collect_remote_managed, init_sync, is_managed_list, plan, status_sync, update_sync
+from .state import StateError, delete_state, read_state, state_lock
+from .sync import (
+    collect_remote_managed,
+    diff_against_state,
+    get_orphan_rules_by_prefix,
+    get_orphans_by_prefix,
+    init_sync,
+    is_managed_list,
+    is_prefix_list,
+    plan,
+    status_sync,
+    update_sync,
+)
 
 console = Console()
 SUPPORTED_LANGUAGES = {"en", "ru"}
@@ -224,9 +236,14 @@ def _t(key: str) -> str:
 
 
 def _write_language(language: str) -> None:
+    import os as _os
+
     env_path = Path(".env")
     if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
         updated = False
         for index, line in enumerate(lines):
             if line.startswith("LANGUAGE="):
@@ -235,9 +252,25 @@ def _write_language(language: str) -> None:
                 break
         if not updated:
             lines.append(f"LANGUAGE={language}")
-        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp = env_path.with_name(env_path.name + f".tmp-{_os.getpid()}")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            _os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(env_path)
+        try:
+            _os.chmod(env_path, 0o600)
+        except OSError:
+            pass
         return
-    env_path.write_text(f"LANGUAGE={language}\n", encoding="utf-8")
+    tmp = env_path.with_name(env_path.name + f".tmp-{_os.getpid()}")
+    tmp.write_text(f"LANGUAGE={language}\n", encoding="utf-8")
+    try:
+        _os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(env_path)
 
 
 def _pause() -> None:
@@ -289,28 +322,39 @@ def _run_with_progress(operation):
 
 def _setup_env() -> None:
     language = _language()
-    account = Prompt.ask(_t("prompt_account"))
-    token = Prompt.ask(_t("prompt_token"), password=True)
-    source = Prompt.ask(_t("prompt_source"), default="https://small.oisd.nl")
-    prefix = Prompt.ask(_t("prompt_prefix"), default="oisd-small-auto")
-    rule_name = Prompt.ask(_t("prompt_rule_name"), default="OISD Small Auto Block")
-    chunk = Prompt.ask(_t("prompt_chunk"), default="1000")
-
-    env = "\n".join(
-        [
-            f"CLOUDFLARE_ACCOUNT_ID={account}",
-            f"CLOUDFLARE_API_TOKEN={token}",
-            f"OISD_SOURCE_URL={source}",
-            f"LIST_PREFIX={prefix}",
-            f"RULE_NAME={rule_name}",
-            f"CHUNK_SIZE={chunk}",
-            "RULE_PRECEDENCE=5000",
-            "STATE_FILE=.cf-zt-oisd-state.json",
-            "DRY_RUN=false",
-            f"LANGUAGE={language}",
-        ]
-    )
-    Path(".env").write_text(env + "\n", encoding="utf-8")
+    account = Prompt.ask(_t("prompt_account")).strip()
+    token = Prompt.ask(_t("prompt_token"), password=True).strip()
+    source = Prompt.ask(_t("prompt_source"), default="https://small.oisd.nl").strip()
+    prefix = Prompt.ask(_t("prompt_prefix"), default="oisd-small-auto").strip()
+    rule_name = Prompt.ask(_t("prompt_rule_name"), default="OISD Small Auto Block").strip()
+    chunk = Prompt.ask(_t("prompt_chunk"), default="1000").strip()
+    if chunk and not chunk.isdigit():
+        console.print("[red][ERROR] Chunk size must be a number[/red]")
+        return
+    try:
+        write_env_file(
+            ".env",
+            {
+                "CLOUDFLARE_ACCOUNT_ID": account,
+                "CLOUDFLARE_API_TOKEN": token,
+                "OISD_SOURCE_URL": source,
+                "LIST_PREFIX": prefix,
+                "RULE_NAME": rule_name,
+                "CHUNK_SIZE": chunk or "1000",
+                "RULE_PRECEDENCE": "5000",
+                "LIST_WORKERS": "4",
+                "STATE_FILE": ".cf-zt-oisd-state.json",
+                "DRY_RUN": "false",
+                "LANGUAGE": language,
+                "MIN_DOMAINS": "5000",
+                "MAX_DROP_RATIO": "0.5",
+                "MAX_LISTS": "500",
+                "ALLOWLIST": "",
+            },
+        )
+    except Exception as exc:
+        console.print(f"[red][ERROR][/red] {exc}")
+        return
     console.print(f"[green][OK][/green] {_t('env_created')}")
     console.print(_t("next_step"))
 
@@ -365,12 +409,27 @@ def _dry_run() -> None:
     cfg.dry_run = True
 
     domains, _, chunks = plan(cfg)
+    try:
+        existing_state = read_state(cfg.state_file)
+    except StateError:
+        existing_state = None
     cf = CloudflareClient(cfg.cloudflare_api_token, cfg.cloudflare_account_id, dry_run=False)
     try:
         remote_lists, remote_rules = collect_remote_managed(cfg, cf)
     finally:
         cf.close()
 
+    diff = diff_against_state(existing_state, chunks)
+    if diff.get("mode") == "no-state":
+        create_n = max(len(chunks) - len(remote_lists), 0)
+        update_n = 0
+        delete_n = max(len(remote_lists) - len(chunks), 0)
+        estimated = True
+    else:
+        create_n = diff["create_lists"]
+        update_n = diff["update_lists"]
+        delete_n = diff["delete_lists"]
+        estimated = False
     table = Table(title=_t("dry_run_title"))
     table.add_column(_t("column_param"))
     table.add_column(_t("column_value"))
@@ -378,17 +437,18 @@ def _dry_run() -> None:
     table.add_row(_t("processed_domains"), str(len(domains)))
     table.add_row(_t("chunk_size"), str(cfg.chunk_size))
     table.add_row(_t("needed_lists"), str(len(chunks)))
-    table.add_row(_t("create_lists"), str(max(len(chunks) - len(remote_lists), 0)))
-    table.add_row(_t("update_lists"), str(min(len(chunks), len(remote_lists))))
-    table.add_row(_t("delete_extra_lists"), str(max(len(remote_lists) - len(chunks), 0)))
+    table.add_row(_t("create_lists"), str(create_n))
+    table.add_row(_t("update_lists"), str(update_n))
+    table.add_row(_t("delete_extra_lists"), str(delete_n))
     table.add_row(_t("create_dns_rule"), _t("yes") if not remote_rules else _t("no"))
     console.print(table)
+    if estimated:
+        console.print("[yellow]Estimate without state file.[/yellow]")
     console.print(f"[cyan][INFO][/cyan] {_t('dry_run_info')}")
 
 
 def _init() -> None:
     cfg = load_config(require_cloudflare=True)
-    cfg.dry_run = False
 
     console.print(_t("init_notice"))
     if not Confirm.ask(_t("continue"), default=False):
@@ -411,8 +471,14 @@ def _sync() -> None:
 
 def _status() -> None:
     cfg = load_config(require_cloudflare=True)
-    info = status_sync(cfg)
+    try:
+        info = status_sync(cfg)
+    except StateError as exc:
+        console.print(f"[red][ERROR][/red] {exc}")
+        return
     state = info["state"]
+    if info.get("state_error"):
+        console.print(f"[red][ERROR][/red] {info['state_error']}")
 
     console.print(_t("status_title"))
     console.print(f"{_t('source_oisd')}: {cfg.oisd_source_url}")
@@ -443,43 +509,98 @@ def _status() -> None:
 
 def _delete() -> None:
     cfg = load_config(require_cloudflare=True)
-    state = read_state(cfg.state_file)
-    state_list_ids = {c.cloudflare_list_id for c in state.chunks} if state else set()
+    try:
+        state = read_state(cfg.state_file)
+    except StateError as exc:
+        console.print(f"[red][ERROR][/red] {exc}")
+        return
 
     cf = CloudflareClient(cfg.cloudflare_api_token, cfg.cloudflare_account_id, dry_run=False)
     try:
         all_lists = cf.list_gateway_lists()
         all_rules = cf.list_gateway_rules()
+        # Strict: только объекты с маркером.
         managed_lists = [
-            x for x in all_lists if is_managed_list(x, cfg.list_prefix) or x.get("id") in state_list_ids
+            x for x in all_lists if is_managed_list(x, cfg.list_prefix)
         ]
+        orphans = get_orphans_by_prefix(all_lists, cfg.list_prefix)
+        state_ids = {c.cloudflare_list_id for c in state.chunks} if state else set()
+        state_only = [x for x in all_lists if x.get("id") in state_ids and x not in managed_lists]
         managed_rules = [
             x
             for x in all_rules
             if (x.get("name") == cfg.rule_name and "Managed by cf-zt-oisd-sync" in str(x.get("description", "")))
-            or (state and state.rule and x.get("id") == state.rule.cloudflare_rule_id)
         ]
+        # State rule с маркером — тоже managed.
+        if state and state.rule:
+            for x in all_rules:
+                if x.get("id") == state.rule.cloudflare_rule_id and x not in managed_rules:
+                    if "Managed by cf-zt-oisd-sync" in str(x.get("description", "")):
+                        managed_rules.append(x)
+        # Orphan rules that block list deletion (ссылаются на наши списки)
+        list_ids = {str(x.get("id")) for x in all_lists if str(x.get("name", "")).startswith(cfg.list_prefix)}
+        orphan_rules = get_orphan_rules_by_prefix(all_rules, cfg.list_prefix, list_ids, cfg.rule_name)
 
         console.print(_t("will_delete"))
-        console.print(f"DNS rules: {len(managed_rules)}")
-        console.print(f"Cloudflare lists: {len(managed_lists)}")
+        console.print(f"DNS rules: {len(managed_rules)} + orphans {len(orphan_rules)}")
+        console.print(f"Cloudflare lists (managed): {len(managed_lists)}")
+        if orphans:
+            console.print(f"[yellow]Сироты по префиксу '{cfg.list_prefix}' без маркера: {len(orphans)} — будут удалены вместе с managed[/yellow]")
+            for lst in orphans[:10]:
+                console.print(f"  orphan {lst.get('name')} id={lst.get('id')}")
+            if len(orphans) > 10:
+                console.print(f"  ... и ещё {len(orphans)-10}")
+        if orphan_rules:
+            console.print(f"[yellow]Сироты-rules по префиксу: {len(orphan_rules)}[/yellow]")
+            for r in orphan_rules[:5]:
+                console.print(f"  orphan rule {r.get('name')} id={r.get('id')}")
+        if state_only:
+            console.print(f"[yellow]State-only без маркера: {len(state_only)}[/yellow]")
         console.print(f"[red]{_t('cannot_undo')}[/red]")
         if Prompt.ask(_t("confirm_delete")) != "DELETE":
             console.print(f"[yellow][WARNING][/yellow] {_t('operation_cancelled')}")
             return
 
-        for rule in managed_rules:
-            cf.delete_gateway_rule(rule["id"])
-        for item in managed_lists:
-            cf.delete_gateway_list(item["id"])
+        # Теперь сироты удаляются вместе с managed по умолчанию (пользователь ожидает чистки oisd-small-auto-*) — 8 потоков
+        all_to_delete = managed_lists + orphans
+        delete_workers = min(8, max(1, cfg.list_workers))
+        with state_lock(cfg.state_file, timeout=10.0):
+            for rule in managed_rules + orphan_rules:
+                try:
+                    cf.delete_gateway_rule(rule["id"])
+                    console.print(f"  deleted rule {rule.get('name')} {rule.get('id')}")
+                except Exception as exc:
+                    console.print(f"[red]Не удалось удалить rule {rule.get('id')}: {exc}[/red]")
+            if all_to_delete:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task(f"Удаление {len(all_to_delete)} списков (workers={delete_workers})", total=len(all_to_delete))
+                    with ThreadPoolExecutor(max_workers=delete_workers) as executor:
+                        futures = {executor.submit(cf.delete_gateway_list, item["id"]): item for item in all_to_delete}
+                        for future in as_completed(futures):
+                            item = futures[future]
+                            try:
+                                future.result()
+                                console.print(f"  deleted {'orphan' if item in orphans else 'list'} {item.get('name')} {item.get('id')}")
+                            except Exception as exc:
+                                console.print(f"[red]Не удалось удалить {item.get('name')}: {exc}[/red]")
+                            progress.advance(task, 1)
     finally:
         cf.close()
 
     removed_state = delete_state(cfg.state_file)
     console.print(f"[green][OK][/green] {_t('delete_done')}")
-    console.print(f"{_t('dns_rules_removed')}: {len(managed_rules)}")
-    console.print(f"{_t('cf_lists_removed')}: {len(managed_lists)}")
+    console.print(f"{_t('dns_rules_removed')}: {len(managed_rules) + len(orphan_rules)}")
+    console.print(f"{_t('cf_lists_removed')}: {len(all_to_delete)} (managed {len(managed_lists)} + orphans {len(orphans)})")
     console.print(f"{_t('state_removed')}: {_t('yes') if removed_state else _t('no')}")
+    if orphans and not include_orphans:
+        console.print(f"[yellow]Пропущены сироты: {len(orphans)} — удалите через CLI: cf-zt-oisd-sync delete --include-orphans[/yellow]")
 
 
 def _doctor() -> None:
@@ -493,11 +614,35 @@ def _doctor() -> None:
         state = None
         checks.append(("ERROR", str(exc)))
 
-    cf = CloudflareClient(cfg.cloudflare_api_token, cfg.cloudflare_account_id)
+    if not cfg.oisd_source_url.startswith("https://"):
+        checks.append(("ERROR", "OISD URL must use https"))
+    else:
+        checks.append(("OK", "OISD URL uses https"))
+
+    try:
+        cf = CloudflareClient(cfg.cloudflare_api_token, cfg.cloudflare_account_id)
+    except Exception as exc:
+        console.print(_t("diagnostics"))
+        console.print(f"[red][ERROR][/red] {exc}")
+        return
     try:
         managed_lists, managed_rules = collect_remote_managed(cfg, cf)
+        # Также проверим сирот по префиксу
+        try:
+            all_lists = cf.list_gateway_lists()
+            orphans = get_orphans_by_prefix(all_lists, cfg.list_prefix)
+            if orphans:
+                checks.append(("WARNING", f"Сироты по префиксу '{cfg.list_prefix}' без маркера: {len(orphans)}"))
+        except Exception:
+            pass
+    except Exception as exc:
+        checks.append(("ERROR", f"Cloudflare API: {exc}"))
+        managed_lists, managed_rules = [], []
     finally:
-        cf.close()
+        try:
+            cf.close()
+        except Exception:
+            pass
 
     if state:
         remote_ids = {x.get("id") for x in managed_lists}

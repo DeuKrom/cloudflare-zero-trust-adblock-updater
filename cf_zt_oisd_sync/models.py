@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -36,4 +36,4 @@ class AppState:
 
     @staticmethod
     def now_utc_iso() -> str:
-        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
