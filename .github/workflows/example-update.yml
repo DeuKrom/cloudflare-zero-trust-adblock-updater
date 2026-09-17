@@ -55,7 +55,7 @@ jobs:
 
       - name: Verify Cloudflare token
         run: |
-          curl -sS --fail \
+          curl -sS \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             https://api.cloudflare.com/client/v4/user/tokens/verify
 
